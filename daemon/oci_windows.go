@@ -10,6 +10,7 @@ import (
 	containertypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/oci"
+	"github.com/docker/docker/oci/caps"
 	"github.com/docker/docker/pkg/sysinfo"
 	"github.com/docker/docker/pkg/system"
 	"github.com/opencontainers/runtime-spec/specs-go"
@@ -211,7 +212,9 @@ func (daemon *Daemon) createSpec(c *container.Container) (*specs.Spec, error) {
 		if !system.LCOWSupported() {
 			return nil, fmt.Errorf("Linux containers on Windows are not supported")
 		}
-		daemon.createSpecLinuxFields(c, &s)
+		if err := daemon.createSpecLinuxFields(c, &s); err != nil {
+			return nil, err
+		}
 	default:
 		return nil, fmt.Errorf("Unsupported platform %q", img.OS)
 	}
@@ -247,6 +250,128 @@ func (daemon *Daemon) createSpecWindowsFields(c *container.Container, s *specs.S
 	// First boot optimization
 	s.Windows.IgnoreFlushesDuringBoot = !c.HasBeenStartedBefore
 
+	setResourcesInSpec(c, s, isHyperV)
+
+	// Read and add credentials from the security options if a credential spec has been provided.
+	if c.HostConfig.SecurityOpt != nil {
+		cs := ""
+		for _, sOpt := range c.HostConfig.SecurityOpt {
+			sOpt = strings.ToLower(sOpt)
+			if !strings.Contains(sOpt, "=") {
+				return fmt.Errorf("invalid security option: no equals sign in supplied value %s", sOpt)
+			}
+			var splitsOpt []string
+			splitsOpt = strings.SplitN(sOpt, "=", 2)
+			if len(splitsOpt) != 2 {
+				return fmt.Errorf("invalid security option: %s", sOpt)
+			}
+			if splitsOpt[0] != "credentialspec" {
+				return fmt.Errorf("security option not supported: %s", splitsOpt[0])
+			}
+
+			var (
+				match   bool
+				csValue string
+				err     error
+			)
+			if match, csValue = getCredentialSpec("file://", splitsOpt[1]); match {
+				if csValue == "" {
+					return fmt.Errorf("no value supplied for file:// credential spec security option")
+				}
+				if cs, err = readCredentialSpecFile(c.ID, daemon.root, filepath.Clean(csValue)); err != nil {
+					return err
+				}
+			} else if match, csValue = getCredentialSpec("registry://", splitsOpt[1]); match {
+				if csValue == "" {
+					return fmt.Errorf("no value supplied for registry:// credential spec security option")
+				}
+				if cs, err = readCredentialSpecRegistry(c.ID, csValue); err != nil {
+					return err
+				}
+			} else if match, csValue = getCredentialSpec("config://", splitsOpt[1]); match {
+				// if the container does not have a DependencyStore, then it
+				// isn't swarmkit managed. In order to avoid creating any
+				// impression that `config://` is a valid API, return the same
+				// error as if you'd passed any other random word.
+				if c.DependencyStore == nil {
+					return fmt.Errorf("invalid credential spec security option - value must be prefixed file:// or registry:// followed by a value")
+				}
+
+				// after this point, we can return regular swarmkit-relevant
+				// errors, because we'll know this container is managed.
+				if csValue == "" {
+					return fmt.Errorf("no value supplied for config:// credential spec security option")
+				}
+
+				csConfig, err := c.DependencyStore.Configs().Get(csValue)
+				if err != nil {
+					return errors.Wrap(err, "error getting value from config store")
+				}
+				// stuff the resulting secret data into a string to use as the
+				// CredentialSpec
+				cs = string(csConfig.Spec.Data)
+			} else {
+				return fmt.Errorf("invalid credential spec security option - value must be prefixed file:// or registry:// followed by a value")
+			}
+		}
+		s.Windows.CredentialSpec = cs
+	}
+
+	// Do we have any assigned devices?
+	if len(c.HostConfig.Devices) > 0 {
+		if isHyperV {
+			return errors.New("device assignment is not supported for HyperV containers")
+		}
+		if system.GetOSVersion().Build < 17763 {
+			return errors.New("device assignment requires Windows builds RS5 (17763+) or later")
+		}
+		for _, deviceMapping := range c.HostConfig.Devices {
+			srcParts := strings.SplitN(deviceMapping.PathOnHost, "/", 2)
+			if len(srcParts) != 2 {
+				return errors.New("invalid device assignment path")
+			}
+			if srcParts[0] != "class" {
+				return errors.Errorf("invalid device assignment type: '%s' should be 'class'", srcParts[0])
+			}
+			wd := specs.WindowsDevice{
+				ID:     srcParts[1],
+				IDType: srcParts[0],
+			}
+			s.Windows.Devices = append(s.Windows.Devices, wd)
+		}
+	}
+
+	return nil
+}
+
+// Sets the Linux-specific fields of the OCI spec
+// TODO: @jhowardmsft LCOW Support. We need to do a lot more pulling in what can
+// be pulled in from oci_linux.go.
+func (daemon *Daemon) createSpecLinuxFields(c *container.Container, s *specs.Spec) error {
+	if len(s.Process.Cwd) == 0 {
+		s.Process.Cwd = `/`
+	}
+	s.Root.Path = "rootfs"
+	s.Root.Readonly = c.HostConfig.ReadonlyRootfs
+
+	setResourcesInSpec(c, s, true) // LCOW is Hyper-V only
+
+	capabilities, err := caps.TweakCapabilities(oci.DefaultCapabilities(), c.HostConfig.CapAdd, c.HostConfig.CapDrop, c.HostConfig.Capabilities, c.HostConfig.Privileged)
+	if err != nil {
+		return fmt.Errorf("linux spec capabilities: %v", err)
+	}
+	if err := oci.SetCapabilities(s, capabilities); err != nil {
+		return fmt.Errorf("linux spec capabilities: %v", err)
+	}
+	devPermissions, err := oci.AppendDevicePermissionsFromCgroupRules(nil, c.HostConfig.DeviceCgroupRules)
+	if err != nil {
+		return fmt.Errorf("linux runtime spec devices: %v", err)
+	}
+	s.Linux.Resources.Devices = devPermissions
+	return nil
+}
+
+func setResourcesInSpec(c *container.Container, s *specs.Spec, isHyperV bool) {
 	// In s.Windows.Resources
 	cpuShares := uint16(c.HostConfig.CPUShares)
 	cpuMaximum := uint16(c.HostConfig.CPUPercent) * 100
@@ -286,62 +411,6 @@ func (daemon *Daemon) createSpecWindowsFields(c *container.Container, s *specs.S
 			Iops: &c.HostConfig.IOMaximumIOps,
 		},
 	}
-
-	// Read and add credentials from the security options if a credential spec has been provided.
-	if c.HostConfig.SecurityOpt != nil {
-		cs := ""
-		for _, sOpt := range c.HostConfig.SecurityOpt {
-			sOpt = strings.ToLower(sOpt)
-			if !strings.Contains(sOpt, "=") {
-				return fmt.Errorf("invalid security option: no equals sign in supplied value %s", sOpt)
-			}
-			var splitsOpt []string
-			splitsOpt = strings.SplitN(sOpt, "=", 2)
-			if len(splitsOpt) != 2 {
-				return fmt.Errorf("invalid security option: %s", sOpt)
-			}
-			if splitsOpt[0] != "credentialspec" {
-				return fmt.Errorf("security option not supported: %s", splitsOpt[0])
-			}
-
-			var (
-				match   bool
-				csValue string
-				err     error
-			)
-			if match, csValue = getCredentialSpec("file://", splitsOpt[1]); match {
-				if csValue == "" {
-					return fmt.Errorf("no value supplied for file:// credential spec security option")
-				}
-				if cs, err = readCredentialSpecFile(c.ID, daemon.root, filepath.Clean(csValue)); err != nil {
-					return err
-				}
-			} else if match, csValue = getCredentialSpec("registry://", splitsOpt[1]); match {
-				if csValue == "" {
-					return fmt.Errorf("no value supplied for registry:// credential spec security option")
-				}
-				if cs, err = readCredentialSpecRegistry(c.ID, csValue); err != nil {
-					return err
-				}
-			} else {
-				return fmt.Errorf("invalid credential spec security option - value must be prefixed file:// or registry:// followed by a value")
-			}
-		}
-		s.Windows.CredentialSpec = cs
-	}
-
-	return nil
-}
-
-// Sets the Linux-specific fields of the OCI spec
-// TODO: @jhowardmsft LCOW Support. We need to do a lot more pulling in what can
-// be pulled in from oci_linux.go.
-func (daemon *Daemon) createSpecLinuxFields(c *container.Container, s *specs.Spec) {
-	if len(s.Process.Cwd) == 0 {
-		s.Process.Cwd = `/`
-	}
-	s.Root.Path = "rootfs"
-	s.Root.Readonly = c.HostConfig.ReadonlyRootfs
 }
 
 func escapeArgs(args []string) []string {

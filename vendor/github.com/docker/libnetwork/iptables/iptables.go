@@ -87,11 +87,16 @@ func initFirewalld() {
 }
 
 func detectIptables() {
-	path, err := exec.LookPath("iptables")
+	path, err := exec.LookPath("iptables-legacy") // debian has iptables-legacy and iptables-nft now
 	if err != nil {
-		return
+		path, err = exec.LookPath("iptables")
+		if err != nil {
+			return
+		}
 	}
+
 	iptablesPath = path
+
 	supportsXlock = exec.Command(iptablesPath, "--wait", "-L", "-n").Run() == nil
 	mj, mn, mc, err := GetVersion()
 	if err != nil {
@@ -477,7 +482,7 @@ func raw(args ...string) ([]byte, error) {
 	return filterOutput(startTime, output, args...), err
 }
 
-// RawCombinedOutput inernally calls the Raw function and returns a non nil
+// RawCombinedOutput internally calls the Raw function and returns a non nil
 // error if Raw returned a non nil error or a non empty output
 func RawCombinedOutput(args ...string) error {
 	if output, err := Raw(args...); err != nil || len(output) != 0 {

@@ -42,10 +42,7 @@ var (
 
 // IsSkipPlugin returns true if the error is skipping the plugin
 func IsSkipPlugin(err error) bool {
-	if errors.Cause(err) == ErrSkipPlugin {
-		return true
-	}
-	return false
+	return errors.Cause(err) == ErrSkipPlugin
 }
 
 // Type is the type of the plugin
@@ -54,10 +51,14 @@ type Type string
 func (t Type) String() string { return string(t) }
 
 const (
-	// AllPlugins declares that the plugin should be initialized after all others.
-	AllPlugins Type = "*"
+	// InternalPlugin implements an internal plugin to containerd
+	InternalPlugin Type = "io.containerd.internal.v1"
 	// RuntimePlugin implements a runtime
 	RuntimePlugin Type = "io.containerd.runtime.v1"
+	// RuntimePluginV2 implements a runtime v2
+	RuntimePluginV2 Type = "io.containerd.runtime.v2"
+	// ServicePlugin implements a internal service
+	ServicePlugin Type = "io.containerd.service.v1"
 	// GRPCPlugin implements a grpc service
 	GRPCPlugin Type = "io.containerd.grpc.v1"
 	// SnapshotPlugin implements a snapshotter
@@ -87,7 +88,7 @@ type Registration struct {
 
 	// InitFn is called when initializing a plugin. The registration and
 	// context are passed in. The init function may modify the registration to
-	// add exports, capabilites and platform support declarations.
+	// add exports, capabilities and platform support declarations.
 	InitFn func(*InitContext) (interface{}, error)
 }
 

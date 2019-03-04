@@ -44,7 +44,6 @@ create network namespaces and allocate interfaces for containers to use.
 package libnetwork
 
 import (
-	"container/heap"
 	"fmt"
 	"net"
 	"path/filepath"
@@ -70,6 +69,7 @@ import (
 	"github.com/docker/libnetwork/netlabel"
 	"github.com/docker/libnetwork/osl"
 	"github.com/docker/libnetwork/types"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -121,7 +121,7 @@ type NetworkController interface {
 	// Stop network controller
 	Stop()
 
-	// ReloadCondfiguration updates the controller configuration
+	// ReloadConfiguration updates the controller configuration
 	ReloadConfiguration(cfgOptions ...config.Option) error
 
 	// SetClusterProvider sets cluster provider
@@ -700,6 +700,9 @@ func (c *controller) RegisterDriver(networkType string, driver driverapi.Driver,
 	return nil
 }
 
+// XXX  This should be made driver agnostic.  See comment below.
+const overlayDSROptionString = "dsr"
+
 // NewNetwork creates a new network of the specified network type. The options
 // are network specific and modeled in a generic way.
 func (c *controller) NewNetwork(networkType, name string, id string, options ...NetworkOption) (Network, error) {
@@ -723,15 +726,16 @@ func (c *controller) NewNetwork(networkType, name string, id string, options ...
 	defaultIpam := defaultIpamForNetworkType(networkType)
 	// Construct the network object
 	network := &network{
-		name:        name,
-		networkType: networkType,
-		generic:     map[string]interface{}{netlabel.GenericData: make(map[string]string)},
-		ipamType:    defaultIpam,
-		id:          id,
-		created:     time.Now(),
-		ctrlr:       c,
-		persist:     true,
-		drvOnce:     &sync.Once{},
+		name:             name,
+		networkType:      networkType,
+		generic:          map[string]interface{}{netlabel.GenericData: make(map[string]string)},
+		ipamType:         defaultIpam,
+		id:               id,
+		created:          time.Now(),
+		ctrlr:            c,
+		persist:          true,
+		drvOnce:          &sync.Once{},
+		loadBalancerMode: loadBalancerModeDefault,
 	}
 
 	network.processOptions(options...)
@@ -829,6 +833,21 @@ func (c *controller) NewNetwork(networkType, name string, id string, options ...
 		}
 	}()
 
+	// XXX If the driver type is "overlay" check the options for DSR
+	// being set.  If so, set the network's load balancing mode to DSR.
+	// This should really be done in a network option, but due to
+	// time pressure to get this in without adding changes to moby,
+	// swarm and CLI, it is being implemented as a driver-specific
+	// option.  Unfortunately, drivers can't influence the core
+	// "libnetwork.network" data type.  Hence we need this hack code
+	// to implement in this manner.
+	if gval, ok := network.generic[netlabel.GenericData]; ok && network.networkType == "overlay" {
+		optMap := gval.(map[string]string)
+		if _, ok := optMap[overlayDSROptionString]; ok {
+			network.loadBalancerMode = loadBalancerModeDSR
+		}
+	}
+
 addToStore:
 	// First store the endpoint count, then the network. To avoid to
 	// end up with a datastore containing a network and not an epCnt,
@@ -871,7 +890,7 @@ addToStore:
 		}
 	}()
 
-	if len(network.loadBalancerIP) != 0 {
+	if network.hasLoadBalancerEndpoint() {
 		if err = network.createLoadBalancerSandbox(); err != nil {
 			return nil, err
 		}
@@ -1085,7 +1104,7 @@ func (c *controller) NewSandbox(containerID string, options ...SandboxOption) (S
 		sb = &sandbox{
 			id:                 sandboxID,
 			containerID:        containerID,
-			endpoints:          epHeap{},
+			endpoints:          []*endpoint{},
 			epPriority:         map[string]int{},
 			populatedEndpoints: map[string]struct{}{},
 			config:             containerConfig{},
@@ -1093,8 +1112,6 @@ func (c *controller) NewSandbox(containerID string, options ...SandboxOption) (S
 			extDNS:             []extDNSEntry{},
 		}
 	}
-
-	heap.Init(&sb.endpoints)
 
 	sb.processOptions(options...)
 
@@ -1109,6 +1126,8 @@ func (c *controller) NewSandbox(containerID string, options ...SandboxOption) (S
 		sb.config.hostsPath = filepath.Join(c.cfg.Daemon.DataDir, "/network/files/hosts")
 		sb.config.resolvConfPath = filepath.Join(c.cfg.Daemon.DataDir, "/network/files/resolv.conf")
 		sb.id = "ingress_sbox"
+	} else if sb.loadBalancerNID != "" {
+		sb.id = "lb_" + sb.loadBalancerNID
 	}
 	c.Unlock()
 
@@ -1144,6 +1163,11 @@ func (c *controller) NewSandbox(containerID string, options ...SandboxOption) (S
 		if sb.osSbox, err = osl.NewSandbox(sb.Key(), !sb.config.useDefaultSandBox, false); err != nil {
 			return nil, fmt.Errorf("failed to create new osl sandbox: %v", err)
 		}
+	}
+
+	if sb.osSbox != nil {
+		// Apply operating specific knobs on the load balancer sandbox
+		sb.osSbox.ApplyOSTweaks(sb.oslTypes)
 	}
 
 	c.Lock()
@@ -1255,7 +1279,7 @@ func (c *controller) loadDriver(networkType string) error {
 	}
 
 	if err != nil {
-		if err == plugins.ErrNotFound {
+		if errors.Cause(err) == plugins.ErrNotFound {
 			return types.NotFoundErrorf(err.Error())
 		}
 		return err

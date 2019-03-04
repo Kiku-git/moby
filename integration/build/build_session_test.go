@@ -7,21 +7,33 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/docker/docker/api/types"
 	dclient "github.com/docker/docker/client"
+	"github.com/docker/docker/internal/test/daemon"
 	"github.com/docker/docker/internal/test/fakecontext"
 	"github.com/docker/docker/internal/test/request"
-	"github.com/gotestyourself/gotestyourself/assert"
-	is "github.com/gotestyourself/gotestyourself/assert/cmp"
-	"github.com/gotestyourself/gotestyourself/skip"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/filesync"
 	"golang.org/x/sync/errgroup"
+	"gotest.tools/assert"
+	is "gotest.tools/assert/cmp"
+	"gotest.tools/skip"
 )
 
 func TestBuildWithSession(t *testing.T) {
-	skip.If(t, !testEnv.DaemonInfo.ExperimentalBuild)
+	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
 
-	client := testEnv.APIClient()
+	var client dclient.APIClient
+	if !testEnv.DaemonInfo.ExperimentalBuild {
+		skip.If(t, testEnv.IsRemoteDaemon, "cannot run daemon when remote daemon")
+
+		d := daemon.New(t, daemon.WithExperimental)
+		d.StartWithBusybox(t)
+		defer d.Stop(t)
+		client = d.NewClientT(t)
+	} else {
+		client = testEnv.APIClient()
+	}
 
 	dockerfile := `
 		FROM busybox
@@ -76,7 +88,7 @@ func TestBuildWithSession(t *testing.T) {
 	assert.Check(t, is.Contains(string(outBytes), "Successfully built"))
 	assert.Check(t, is.Equal(strings.Count(string(outBytes), "Using cache"), 4))
 
-	_, err = client.BuildCachePrune(context.TODO())
+	_, err = client.BuildCachePrune(context.TODO(), types.BuildCachePruneOptions{All: true})
 	assert.Check(t, err)
 
 	du, err = client.DiskUsage(context.TODO())
@@ -85,7 +97,8 @@ func TestBuildWithSession(t *testing.T) {
 }
 
 func testBuildWithSession(t *testing.T, client dclient.APIClient, daemonHost string, dir, dockerfile string) (outStr string) {
-	sess, err := session.NewSession("foo1", "foo")
+	ctx := context.Background()
+	sess, err := session.NewSession(ctx, "foo1", "foo")
 	assert.Check(t, err)
 
 	fsProvider := filesync.NewFSSyncProvider([]filesync.SyncedDir{
@@ -93,7 +106,7 @@ func testBuildWithSession(t *testing.T, client dclient.APIClient, daemonHost str
 	})
 	sess.Allow(fsProvider)
 
-	g, ctx := errgroup.WithContext(context.Background())
+	g, ctx := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
 		return sess.Run(ctx, client.DialSession)

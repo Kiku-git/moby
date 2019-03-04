@@ -40,6 +40,7 @@ import (
 	"github.com/containerd/typeurl"
 	google_protobuf "github.com/gogo/protobuf/types"
 	digest "github.com/opencontainers/go-digest"
+	is "github.com/opencontainers/image-spec/specs-go"
 	"github.com/opencontainers/image-spec/specs-go/v1"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
@@ -169,6 +170,11 @@ type task struct {
 	pid uint32
 }
 
+// ID of the task
+func (t *task) ID() string {
+	return t.id
+}
+
 // Pid returns the pid or process id for the task
 func (t *task) Pid() uint32 {
 	return t.pid
@@ -179,8 +185,10 @@ func (t *task) Start(ctx context.Context) error {
 		ContainerID: t.id,
 	})
 	if err != nil {
-		t.io.Cancel()
-		t.io.Close()
+		if t.io != nil {
+			t.io.Cancel()
+			t.io.Close()
+		}
 		return errdefs.FromGRPC(err)
 	}
 	t.pid = r.Pid
@@ -386,7 +394,7 @@ func (t *task) Checkpoint(ctx context.Context, opts ...CheckpointTaskOpts) (Imag
 	if err != nil {
 		return nil, err
 	}
-	defer done()
+	defer done(ctx)
 
 	request := &tasks.CheckpointTaskRequest{
 		ContainerID: t.id,
@@ -419,6 +427,9 @@ func (t *task) Checkpoint(ctx context.Context, opts ...CheckpointTaskOpts) (Imag
 		return nil, err
 	}
 	index := v1.Index{
+		Versioned: is.Versioned{
+			SchemaVersion: 2,
+		},
 		Annotations: make(map[string]string),
 	}
 	if err := t.checkpointTask(ctx, &index, request); err != nil {
@@ -449,10 +460,7 @@ func (t *task) Checkpoint(ctx context.Context, opts ...CheckpointTaskOpts) (Imag
 	if im, err = t.client.ImageService().Create(ctx, im); err != nil {
 		return nil, err
 	}
-	return &image{
-		client: t.client,
-		i:      im,
-	}, nil
+	return NewImage(t.client, im), nil
 }
 
 // UpdateTaskInfo allows updated specific settings to be changed on a task
@@ -592,7 +600,7 @@ func (t *task) writeIndex(ctx context.Context, index *v1.Index) (d v1.Descriptor
 }
 
 func writeContent(ctx context.Context, store content.Ingester, mediaType, ref string, r io.Reader, opts ...content.Opt) (d v1.Descriptor, err error) {
-	writer, err := store.Writer(ctx, ref, 0, "")
+	writer, err := store.Writer(ctx, content.WithRef(ref))
 	if err != nil {
 		return d, err
 	}
@@ -601,8 +609,11 @@ func writeContent(ctx context.Context, store content.Ingester, mediaType, ref st
 	if err != nil {
 		return d, err
 	}
+
 	if err := writer.Commit(ctx, size, "", opts...); err != nil {
-		return d, err
+		if !errdefs.IsAlreadyExists(err) {
+			return d, err
+		}
 	}
 	return v1.Descriptor{
 		MediaType: mediaType,

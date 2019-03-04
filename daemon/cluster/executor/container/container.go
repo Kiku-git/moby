@@ -172,6 +172,14 @@ func (c *containerConfig) isolation() enginecontainer.Isolation {
 	return convert.IsolationFromGRPC(c.spec().Isolation)
 }
 
+func (c *containerConfig) init() *bool {
+	if c.spec().Init == nil {
+		return nil
+	}
+	init := c.spec().Init.GetValue()
+	return &init
+}
+
 func (c *containerConfig) exposedPorts() map[nat.Port]struct{} {
 	exposedPorts := make(map[nat.Port]struct{})
 	if c.task.Endpoint == nil {
@@ -277,6 +285,8 @@ func convertMount(m api.Mount) enginemount.Mount {
 		mount.Type = enginemount.TypeVolume
 	case api.MountTypeTmpfs:
 		mount.Type = enginemount.TypeTmpfs
+	case api.MountTypeNamedPipe:
+		mount.Type = enginemount.TypeNamedPipe
 	}
 
 	if m.BindOptions != nil {
@@ -355,6 +365,8 @@ func (c *containerConfig) hostConfig() *enginecontainer.HostConfig {
 		Mounts:         c.mounts(),
 		ReadonlyRootfs: c.spec().ReadOnly,
 		Isolation:      c.isolation(),
+		Init:           c.init(),
+		Sysctls:        c.spec().Sysctls,
 	}
 
 	if c.spec().DNSConfig != nil {
@@ -639,6 +651,8 @@ func (c *containerConfig) applyPrivileges(hc *enginecontainer.HostConfig) {
 			hc.SecurityOpt = append(hc.SecurityOpt, "credentialspec=file://"+credentials.GetFile())
 		case *api.Privileges_CredentialSpec_Registry:
 			hc.SecurityOpt = append(hc.SecurityOpt, "credentialspec=registry://"+credentials.GetRegistry())
+		case *api.Privileges_CredentialSpec_Config:
+			hc.SecurityOpt = append(hc.SecurityOpt, "credentialspec=config://"+credentials.GetConfig())
 		}
 	}
 

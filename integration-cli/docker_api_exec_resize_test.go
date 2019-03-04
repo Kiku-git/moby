@@ -64,23 +64,24 @@ func (s *DockerSuite) TestExecResizeImmediatelyAfterExecStart(c *check.C) {
 		}
 
 		payload := bytes.NewBufferString(`{"Tty":true}`)
-		conn, _, err := sockRequestHijack("POST", fmt.Sprintf("/exec/%s/start", execID), payload, "application/json", daemonHost())
+		conn, _, err := sockRequestHijack("POST", fmt.Sprintf("/exec/%s/start", execID), payload, "application/json", request.DaemonHost())
 		if err != nil {
 			return fmt.Errorf("Failed to start the exec: %q", err.Error())
 		}
 		defer conn.Close()
 
 		_, rc, err := request.Post(fmt.Sprintf("/exec/%s/resize?h=24&w=80", execID), request.ContentType("text/plain"))
-		// It's probably a panic of the daemon if io.ErrUnexpectedEOF is returned.
-		if err == io.ErrUnexpectedEOF {
-			return fmt.Errorf("The daemon might have crashed.")
+		if err != nil {
+			// It's probably a panic of the daemon if io.ErrUnexpectedEOF is returned.
+			if err == io.ErrUnexpectedEOF {
+				return fmt.Errorf("The daemon might have crashed.")
+			}
+			// Other error happened, should be reported.
+			return fmt.Errorf("Fail to exec resize immediately after start. Error: %q", err.Error())
 		}
 
-		if err == nil {
-			rc.Close()
-		}
+		rc.Close()
 
-		// We only interested in the io.ErrUnexpectedEOF error, so we return nil otherwise.
 		return nil
 	}
 

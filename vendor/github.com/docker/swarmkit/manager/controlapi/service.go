@@ -1,6 +1,7 @@
 package controlapi
 
 import (
+	"context"
 	"errors"
 	"reflect"
 	"strings"
@@ -18,7 +19,6 @@ import (
 	"github.com/docker/swarmkit/protobuf/ptypes"
 	"github.com/docker/swarmkit/template"
 	gogotypes "github.com/gogo/protobuf/types"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -197,7 +197,7 @@ func validateHealthCheck(hc *api.HealthConfig) error {
 		if err != nil {
 			return err
 		}
-		if interval != 0 && interval < time.Duration(minimumDuration) {
+		if interval != 0 && interval < minimumDuration {
 			return status.Errorf(codes.InvalidArgument, "ContainerSpec: Interval in HealthConfig cannot be less than %s", minimumDuration)
 		}
 	}
@@ -207,7 +207,7 @@ func validateHealthCheck(hc *api.HealthConfig) error {
 		if err != nil {
 			return err
 		}
-		if timeout != 0 && timeout < time.Duration(minimumDuration) {
+		if timeout != 0 && timeout < minimumDuration {
 			return status.Errorf(codes.InvalidArgument, "ContainerSpec: Timeout in HealthConfig cannot be less than %s", minimumDuration)
 		}
 	}
@@ -217,7 +217,7 @@ func validateHealthCheck(hc *api.HealthConfig) error {
 		if err != nil {
 			return err
 		}
-		if sp != 0 && sp < time.Duration(minimumDuration) {
+		if sp != 0 && sp < minimumDuration {
 			return status.Errorf(codes.InvalidArgument, "ContainerSpec: StartPeriod in HealthConfig cannot be less than %s", minimumDuration)
 		}
 	}
@@ -680,13 +680,17 @@ func (s *Server) CreateService(ctx context.Context, request *api.CreateServiceRe
 
 		return store.CreateService(tx, service)
 	})
-	if err != nil {
+	switch err {
+	case store.ErrNameConflict:
+		// Enhance the name-confict error to include the service name. The original
+		// `ErrNameConflict` error-message is included for backward-compatibility
+		// with older consumers of the API performing string-matching.
+		return nil, status.Errorf(codes.AlreadyExists, "%s: service %s already exists", err.Error(), request.Spec.Annotations.Name)
+	case nil:
+		return &api.CreateServiceResponse{Service: service}, nil
+	default:
 		return nil, err
 	}
-
-	return &api.CreateServiceResponse{
-		Service: service,
-	}, nil
 }
 
 // GetService returns a Service given a ServiceID.
@@ -896,7 +900,12 @@ func (s *Server) ListServices(ctx context.Context, request *api.ListServicesRequ
 		}
 	})
 	if err != nil {
-		return nil, err
+		switch err {
+		case store.ErrInvalidFindBy:
+			return nil, status.Errorf(codes.InvalidArgument, err.Error())
+		default:
+			return nil, err
+		}
 	}
 
 	if request.Filters != nil {

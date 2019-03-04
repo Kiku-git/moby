@@ -11,26 +11,27 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/strslice"
 	"github.com/docker/docker/builder"
-	"github.com/docker/docker/builder/dockerfile/instructions"
-	"github.com/docker/docker/builder/dockerfile/shell"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/pkg/system"
 	"github.com/docker/go-connections/nat"
-	"github.com/gotestyourself/gotestyourself/assert"
-	is "github.com/gotestyourself/gotestyourself/assert/cmp"
+	"github.com/moby/buildkit/frontend/dockerfile/instructions"
+	"github.com/moby/buildkit/frontend/dockerfile/shell"
+	"gotest.tools/assert"
+	is "gotest.tools/assert/cmp"
 )
 
 func newBuilderWithMockBackend() *Builder {
 	mockBackend := &MockBackend{}
+	opts := &types.ImageBuildOptions{}
 	ctx := context.Background()
 	b := &Builder{
-		options:       &types.ImageBuildOptions{Platform: runtime.GOOS},
+		options:       opts,
 		docker:        mockBackend,
 		Stdout:        new(bytes.Buffer),
 		clientCtx:     ctx,
 		disableCommit: true,
 		imageSources: newImageSources(ctx, builderOptions{
-			Options: &types.ImageBuildOptions{Platform: runtime.GOOS},
+			Options: opts,
 			Backend: mockBackend,
 		}),
 		imageProber:      newImageProber(mockBackend, nil, false),
@@ -113,7 +114,7 @@ func TestFromScratch(t *testing.T) {
 	err := initializeStage(sb, cmd)
 
 	if runtime.GOOS == "windows" && !system.LCOWSupported() {
-		assert.Check(t, is.Error(err, "Windows does not support FROM scratch"))
+		assert.Check(t, is.Error(err, "Linux containers are not supported on this system"))
 		return
 	}
 
@@ -136,10 +137,10 @@ func TestFromWithArg(t *testing.T) {
 	args := NewBuildArgs(make(map[string]*string))
 
 	val := "sometag"
-	metaArg := instructions.ArgCommand{
+	metaArg := instructions.ArgCommand{KeyValuePairOptional: instructions.KeyValuePairOptional{
 		Key:   "THETAG",
 		Value: &val,
-	}
+	}}
 	cmd := &instructions.Stage{
 		BaseName: "alpine:${THETAG}",
 	}
@@ -154,6 +155,22 @@ func TestFromWithArg(t *testing.T) {
 	assert.Check(t, is.Equal(expected, sb.state.baseImage.ImageID()))
 	assert.Check(t, is.Len(sb.state.buildArgs.GetAllAllowed(), 0))
 	assert.Check(t, is.Len(sb.state.buildArgs.GetAllMeta(), 1))
+}
+
+func TestFromWithArgButBuildArgsNotGiven(t *testing.T) {
+	b := newBuilderWithMockBackend()
+	args := NewBuildArgs(make(map[string]*string))
+
+	metaArg := instructions.ArgCommand{}
+	cmd := &instructions.Stage{
+		BaseName: "${THETAG}",
+	}
+	err := processMetaArg(metaArg, shell.NewLex('\\'), args)
+
+	sb := newDispatchRequest(b, '\\', nil, args, newStagesBuildResults())
+	assert.NilError(t, err)
+	err = initializeStage(sb, cmd)
+	assert.Error(t, err, "base name (${THETAG}) should not be blank")
 }
 
 func TestFromWithUndefinedArg(t *testing.T) {
@@ -376,7 +393,7 @@ func TestArg(t *testing.T) {
 
 	argName := "foo"
 	argVal := "bar"
-	cmd := &instructions.ArgCommand{Key: argName, Value: &argVal}
+	cmd := &instructions.ArgCommand{KeyValuePairOptional: instructions.KeyValuePairOptional{Key: argName, Value: &argVal}}
 	err := dispatch(sb, cmd)
 	assert.NilError(t, err)
 
@@ -471,4 +488,65 @@ func TestRunWithBuildArgs(t *testing.T) {
 
 	// Check that runConfig.Cmd has not been modified by run
 	assert.Check(t, is.DeepEqual(origCmd, sb.state.runConfig.Cmd))
+}
+
+func TestRunIgnoresHealthcheck(t *testing.T) {
+	b := newBuilderWithMockBackend()
+	args := NewBuildArgs(make(map[string]*string))
+	sb := newDispatchRequest(b, '`', nil, args, newStagesBuildResults())
+	b.disableCommit = false
+
+	origCmd := strslice.StrSlice([]string{"cmd", "in", "from", "image"})
+
+	imageCache := &mockImageCache{
+		getCacheFunc: func(parentID string, cfg *container.Config) (string, error) {
+			return "", nil
+		},
+	}
+
+	mockBackend := b.docker.(*MockBackend)
+	mockBackend.makeImageCacheFunc = func(_ []string) builder.ImageCache {
+		return imageCache
+	}
+	b.imageProber = newImageProber(mockBackend, nil, false)
+	mockBackend.getImageFunc = func(_ string) (builder.Image, builder.ROLayer, error) {
+		return &mockImage{
+			id:     "abcdef",
+			config: &container.Config{Cmd: origCmd},
+		}, nil, nil
+	}
+	mockBackend.containerCreateFunc = func(config types.ContainerCreateConfig) (container.ContainerCreateCreatedBody, error) {
+		return container.ContainerCreateCreatedBody{ID: "12345"}, nil
+	}
+	mockBackend.commitFunc = func(cfg backend.CommitConfig) (image.ID, error) {
+		return "", nil
+	}
+	from := &instructions.Stage{BaseName: "abcdef"}
+	err := initializeStage(sb, from)
+	assert.NilError(t, err)
+
+	expectedTest := []string{"CMD-SHELL", "curl -f http://localhost/ || exit 1"}
+	cmd := &instructions.HealthCheckCommand{
+		Health: &container.HealthConfig{
+			Test: expectedTest,
+		},
+	}
+	assert.NilError(t, dispatch(sb, cmd))
+	assert.Assert(t, sb.state.runConfig.Healthcheck != nil)
+
+	mockBackend.containerCreateFunc = func(config types.ContainerCreateConfig) (container.ContainerCreateCreatedBody, error) {
+		// Check the Healthcheck is disabled.
+		assert.Check(t, is.DeepEqual([]string{"NONE"}, config.Config.Healthcheck.Test))
+		return container.ContainerCreateCreatedBody{ID: "123456"}, nil
+	}
+
+	sb.state.buildArgs.AddArg("one", strPtr("two"))
+	run := &instructions.RunCommand{
+		ShellDependantCmdLine: instructions.ShellDependantCmdLine{
+			CmdLine:      strslice.StrSlice{"echo foo"},
+			PrependShell: true,
+		},
+	}
+	assert.NilError(t, dispatch(sb, run))
+	assert.Check(t, is.DeepEqual(expectedTest, sb.state.runConfig.Healthcheck.Test))
 }
